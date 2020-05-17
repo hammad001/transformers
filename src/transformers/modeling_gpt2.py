@@ -94,6 +94,120 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
         pointer.data = torch.from_numpy(array)
     return model
 
+class CrossAttention(nn.Module):
+    def __init__(self, nx, n_ctx, config, scale=False):
+        super().__init__()
+        self.output_attentions = config.output_attentions
+
+        n_state = nx  # in Attention: n_state=768 (nx=n_embd)
+        # [switch nx => n_state from Block to Attention to keep identical to TF implem]
+        assert n_state % config.n_head == 0
+        self.register_buffer(
+            "bias", torch.tril(torch.ones((n_ctx, n_ctx), dtype=torch.uint8)).view(1, 1, n_ctx, n_ctx)
+        )
+        self.register_buffer("masked_bias", torch.tensor(-1e4))
+        self.n_head = config.n_head
+        self.split_size = n_state
+        self.scale = scale
+
+        self.c_attn_q = Conv1D(n_state, nx)
+        self.c_attn_k = Conv1D(n_state, nx)
+        self.c_attn_v = Conv1D(n_state, nx)
+        self.c_proj = Conv1D(n_state, nx)
+        self.attn_dropout = nn.Dropout(config.attn_pdrop)
+        self.resid_dropout = nn.Dropout(config.resid_pdrop)
+        self.pruned_heads = set()
+
+    def prune_heads(self, heads):
+        if len(heads) == 0:
+            return
+        mask = torch.ones(self.n_head, self.split_size // self.n_head)
+        heads = set(heads) - self.pruned_heads  # Convert to set and emove already pruned heads
+        for head in heads:
+            # Compute how many pruned heads are before the head and move the index accordingly
+            head = head - sum(1 if h < head else 0 for h in self.pruned_heads)
+            mask[head] = 0
+        mask = mask.view(-1).contiguous().eq(1)
+        index = torch.arange(len(mask))[mask].long()
+
+        # Prune conv1d layers
+        self.c_attn_q = prune_conv1d_layer(self.c_attn_q, index_attn, dim=1)
+        self.c_attn_k = prune_conv1d_layer(self.c_attn_k, index_attn, dim=1)
+        self.c_attn_v = prune_conv1d_layer(self.c_attn_v, index_attn, dim=1)
+        self.c_proj = prune_conv1d_layer(self.c_proj, index, dim=0)
+
+        # Update hyper params
+        self.split_size = (self.split_size // self.n_head) * (self.n_head - len(heads))
+        self.n_head = self.n_head - len(heads)
+        self.pruned_heads = self.pruned_heads.union(heads)
+
+    def _attn(self, q, k, v, attention_mask=None, head_mask=None):
+        w = torch.matmul(q, k)
+        if self.scale:
+            w = w / (float(v.size(-1)) ** 0.5)
+        nd, ns = w.size(-2), w.size(-1)
+        mask = self.bias[:, :, ns - nd : ns, :ns]
+        w = torch.where(mask.bool(), w, self.masked_bias.to(w.dtype))
+
+        if attention_mask is not None:
+            # Apply the attention mask
+            w = w + attention_mask
+
+        w = nn.Softmax(dim=-1)(w)
+        w = self.attn_dropout(w)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            w = w * head_mask
+
+        outputs = [torch.matmul(w, v)]
+        if self.output_attentions:
+            outputs.append(w)
+        return outputs
+
+    def merge_heads(self, x):
+        x = x.permute(0, 2, 1, 3).contiguous()
+        new_x_shape = x.size()[:-2] + (x.size(-2) * x.size(-1),)
+        return x.view(*new_x_shape)  # in Tensorflow implem: fct merge_states
+
+    def split_heads(self, x, k=False):
+        new_x_shape = x.size()[:-1] + (self.n_head, x.size(-1) // self.n_head)
+        x = x.view(*new_x_shape)  # in Tensorflow implem: fct split_states
+        if k:
+            return x.permute(0, 2, 3, 1)  # (batch, head, head_features, seq_length)
+        else:
+            return x.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
+
+    def forward(self, x, encoder_hidden_states, encoder_layer_past=None, encoder_attention_mask=None, head_mask=None, use_cache=False):
+        query = self.c_attn_q(x)
+
+        if encoder_layer_past is not None:
+            past_key, past_value = encoder_layer_past[0].transpose(-2, -1), encoder_layer_past[1]  # transpose back cf below
+            key = past_key
+            value = past_value
+        else:
+            key = self.c_attn_k(encoder_hidden_states)
+            value = self.c_attn_v(encoder_hidden_states)
+
+        query = self.split_heads(query)
+        key = self.split_heads(key, k=True)
+        value = self.split_heads(value)
+
+        if use_cache is True:
+            present = torch.stack((key.transpose(-2, -1), value))  # transpose to have same shapes for stacking
+        else:
+            present = (None,)
+
+        attn_outputs = self._attn(query, key, value, encoder_attention_mask, head_mask)
+        a = attn_outputs[0]
+
+        a = self.merge_heads(a)
+        a = self.c_proj(a)
+        a = self.resid_dropout(a)
+
+        outputs = [a, present] + attn_outputs[1:]
+        return outputs  # a, encoder_present, (encoder_attentions)
+
 
 class Attention(nn.Module):
     def __init__(self, nx, n_ctx, config, scale=False):
@@ -221,13 +335,18 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, n_ctx, config, scale=False):
         super().__init__()
+        self.output_attentions = config.output_attentions
         nx = config.n_embd
+        self.is_decoder = config.is_decoder
         self.ln_1 = nn.LayerNorm(nx, eps=config.layer_norm_epsilon)
         self.attn = Attention(nx, n_ctx, config, scale)
+        if self.is_decoder:
+            self.cross_attn_ln = nn.LayerNorm(nx, eps=config.layer_norm_epsilon)
+            self.cross_attn = CrossAttention(nx, n_ctx, config, scale)
         self.ln_2 = nn.LayerNorm(nx, eps=config.layer_norm_epsilon)
         self.mlp = MLP(4 * nx, config)
 
-    def forward(self, x, layer_past=None, attention_mask=None, head_mask=None, use_cache=False):
+    def forward(self, x, layer_past=None, attention_mask=None, head_mask=None, encoder_layer_past=None, encoder_hidden_states=None, encoder_attention_mask=None, use_cache=False):
         output_attn = self.attn(
             self.ln_1(x),
             layer_past=layer_past,
@@ -235,14 +354,32 @@ class Block(nn.Module):
             head_mask=head_mask,
             use_cache=use_cache,
         )
+
         a = output_attn[0]  # output_attn: a, present, (attentions)
+        outputs = [output_attn[1]]
+
+        if self.is_decoder and encoder_hidden_states is not None:
+            output_cross_attn = self.cross_attn(self.cross_attn_ln(a),
+                                                 encoder_hidden_states=encoder_hidden_states,
+                                                 encoder_layer_past=encoder_layer_past,
+                                                 encoder_attention_mask=encoder_attention_mask,
+                                                 head_mask=head_mask,
+                                                 use_cache=use_cache,
+                                                 )
+            a = output_cross_attn[0]
+            outputs += [output_cross_attn[1]]
+            import pdb; pdb.set_trace()  # XXX BREAKPOINT
+
 
         x = x + a
         m = self.mlp(self.ln_2(x))
         x = x + m
 
-        outputs = [x] + output_attn[1:]
-        return outputs  # x, present, (attentions)
+        if self.output_attentions:
+            outputs += output_attn[2:] + output_cross_attn[2:]
+        outputs = [x] + outputs
+
+        return outputs  # x, present, encoder_present, (attentions), (encoder_attentions)
 
 
 class GPT2PreTrainedModel(PreTrainedModel):
@@ -340,6 +477,7 @@ GPT2_INPUTS_DOCSTRING = r"""
 class GPT2Model(GPT2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
+        self.config = config
         self.output_hidden_states = config.output_hidden_states
         self.output_attentions = config.output_attentions
 
@@ -374,6 +512,9 @@ class GPT2Model(GPT2PreTrainedModel):
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
+        encoder_past=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
         use_cache=True,
     ):
         r"""
@@ -442,6 +583,8 @@ class GPT2Model(GPT2PreTrainedModel):
             past = [None] * len(self.h)
         else:
             past_length = past[0][0].size(-2)
+        if encoder_past is None:
+            encoder_past = [None] * len(self.h)
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
@@ -466,6 +609,17 @@ class GPT2Model(GPT2PreTrainedModel):
             attention_mask = attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
             attention_mask = (1.0 - attention_mask) * -10000.0
 
+        if self.config.is_decoder:
+            encoder_presents = ()
+            encoder_attention_mask = None
+            # Encoder attention mask.
+            if encoder_hidden_states is not None:
+                encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+                encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+                if encoder_attention_mask is None:
+                    encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
+                encoder_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+
         # Prepare head mask if needed
         # 1.0 in head_mask indicate we keep the head
         # attention_probs has shape bsz x n_heads x N x N
@@ -487,7 +641,7 @@ class GPT2Model(GPT2PreTrainedModel):
         presents = ()
         all_attentions = []
         all_hidden_states = ()
-        for i, (block, layer_past) in enumerate(zip(self.h, past)):
+        for i, (block, layer_past, encoder_layer_past) in enumerate(zip(self.h, past, encoder_past)):
             if self.output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states.view(*output_shape),)
 
@@ -496,15 +650,25 @@ class GPT2Model(GPT2PreTrainedModel):
                 layer_past=layer_past,
                 attention_mask=attention_mask,
                 head_mask=head_mask[i],
+                encoder_layer_past=encoder_layer_past,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
                 use_cache=use_cache,
             )
 
             hidden_states, present = outputs[:2]
             if use_cache is True:
                 presents = presents + (present,)
+                if self.config.is_decoder:
+                    encoder_presents = encoder_presents + (outputs[2],)
 
             if self.output_attentions:
-                all_attentions.append(outputs[2])
+                if self.config.is_decoder:
+                    attn_idx=3
+                    all_attentions.append(outputs[4])
+                else:
+                    attn_idx=2
+                all_attentions.append(outputs[attn_idx])
 
         hidden_states = self.ln_f(hidden_states)
 
@@ -516,6 +680,8 @@ class GPT2Model(GPT2PreTrainedModel):
         outputs = (hidden_states,)
         if use_cache is True:
             outputs = outputs + (presents,)
+            if self.config.is_decoder:
+                outputs = outputs + (encoder_presents,)
         if self.output_hidden_states:
             outputs = outputs + (all_hidden_states,)
         if self.output_attentions:
@@ -523,7 +689,7 @@ class GPT2Model(GPT2PreTrainedModel):
             attention_output_shape = input_shape[:-1] + (-1,) + all_attentions[0].shape[-2:]
             all_attentions = tuple(t.view(*attention_output_shape) for t in all_attentions)
             outputs = outputs + (all_attentions,)
-        return outputs  # last hidden state, (presents), (all hidden_states), (attentions)
+        return outputs  # last hidden state, (presents), (encoder_presents), (all hidden_states), (attentions)
 
 
 @add_start_docstrings(
@@ -542,12 +708,23 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
     def get_output_embeddings(self):
         return self.lm_head
 
-    def prepare_inputs_for_generation(self, input_ids, past, **kwargs):
+    # TODO: Make it consistent with GPT2 model
+    def prepare_inputs_for_generation(self, input_ids, past=None, encoder_past=None, **kwargs):
         # only last token for inputs_ids if past is defined in kwargs
         if past:
             input_ids = input_ids[:, -1].unsqueeze(-1)
 
-        return {"input_ids": input_ids, "past": past, "use_cache": kwargs["use_cache"]}
+        if 'attention_mask' in kwargs:
+            attention_mask=kwargs['attention_mask']
+        else:
+            attention_mask=None
+
+        return_inputs = {"input_ids": input_ids, "past": past, 'attention_mask':attention_mask}
+
+        if encoder_past is not None:
+            return_inputs['encoder_past'] = encoder_past
+
+        return return_inputs
 
     @add_start_docstrings_to_callable(GPT2_INPUTS_DOCSTRING)
     def forward(
@@ -559,11 +736,15 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
+        encoder_past=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        lm_labels=None,
         labels=None,
         use_cache=True,
     ):
         r"""
-        labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`, defaults to :obj:`None`):
+        lm_labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`, defaults to :obj:`None`):
             Labels for language modeling.
             Note that the labels **are shifted** inside the model, i.e. you can set ``lm_labels = input_ids``
             Indices are selected in ``[-100, 0, ..., config.vocab_size]``
@@ -600,10 +781,13 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         model = GPT2LMHeadModel.from_pretrained('gpt2')
 
         input_ids = torch.tensor(tokenizer.encode("Hello, my dog is cute", add_special_tokens=True)).unsqueeze(0)  # Batch size 1
-        outputs = model(input_ids, labels=input_ids)
+        outputs = model(input_ids, lm_labels=input_ids)
         loss, logits = outputs[:2]
 
         """
+        if labels is not None and lm_labels is None:
+            lm_labels=labels
+
         transformer_outputs = self.transformer(
             input_ids,
             past=past,
@@ -612,6 +796,9 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
+            encoder_past=encoder_past,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
             use_cache=use_cache,
         )
         hidden_states = transformer_outputs[0]
@@ -619,7 +806,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         lm_logits = self.lm_head(hidden_states)
 
         outputs = (lm_logits,) + transformer_outputs[1:]
-        if labels is not None:
+        if lm_labels is not None:
             # Shift so that tokens < n predict n
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
@@ -628,7 +815,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             outputs = (loss,) + outputs
 
-        return outputs  # (loss), lm_logits, presents, (all hidden_states), (attentions)
+        return outputs  # (loss), lm_logits, presents, encoder_presents, (all hidden_states), (attentions)
 
 
 @add_start_docstrings(
