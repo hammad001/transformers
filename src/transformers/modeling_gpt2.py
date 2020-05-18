@@ -103,7 +103,7 @@ class CrossAttention(nn.Module):
         # [switch nx => n_state from Block to Attention to keep identical to TF implem]
         assert n_state % config.n_head == 0
         self.register_buffer(
-            "bias", torch.tril(torch.ones((n_ctx, n_ctx), dtype=torch.uint8)).view(1, 1, n_ctx, n_ctx)
+            "bias", torch.ones((n_ctx, n_ctx), dtype=torch.uint8).view(1, 1, n_ctx, n_ctx)
         )
         self.register_buffer("masked_bias", torch.tensor(-1e4))
         self.n_head = config.n_head
@@ -146,7 +146,14 @@ class CrossAttention(nn.Module):
         if self.scale:
             w = w / (float(v.size(-1)) ** 0.5)
         nd, ns = w.size(-2), w.size(-1)
-        mask = self.bias[:, :, ns - nd : ns, :ns]
+        # bias: dim=2, denotes which tokens in key to pay attention to and
+        # dim=3 deonotes the token for which attention is being calculated.
+        # So dim=2 and dim=3 forms a lower triangle matrix for cuasal language
+        # model, since you only want to pay attention to keys that have already
+        # been seen. However, in our case, i.e. for cross attention, we want to
+        # always look at all the encoder keys. Hence, need to set dim=2 from
+        # ns-nd to nd.
+        mask = self.bias[:, :, :nd, :ns]
         w = torch.where(mask.bool(), w, self.masked_bias.to(w.dtype))
 
         if attention_mask is not None:
@@ -180,6 +187,7 @@ class CrossAttention(nn.Module):
 
     def forward(self, x, encoder_hidden_states, encoder_layer_past=None, encoder_attention_mask=None, head_mask=None, use_cache=False):
         query = self.c_attn_q(x)
+        query = self.split_heads(query)
 
         if encoder_layer_past is not None:
             past_key, past_value = encoder_layer_past[0].transpose(-2, -1), encoder_layer_past[1]  # transpose back cf below
@@ -188,10 +196,8 @@ class CrossAttention(nn.Module):
         else:
             key = self.c_attn_k(encoder_hidden_states)
             value = self.c_attn_v(encoder_hidden_states)
-
-        query = self.split_heads(query)
-        key = self.split_heads(key, k=True)
-        value = self.split_heads(value)
+            key = self.split_heads(key, k=True)
+            value = self.split_heads(value)
 
         if use_cache is True:
             present = torch.stack((key.transpose(-2, -1), value))  # transpose to have same shapes for stacking
@@ -368,8 +374,6 @@ class Block(nn.Module):
                                                  )
             a = output_cross_attn[0]
             outputs += [output_cross_attn[1]]
-            import pdb; pdb.set_trace()  # XXX BREAKPOINT
-
 
         x = x + a
         m = self.mlp(self.ln_2(x))
@@ -664,11 +668,10 @@ class GPT2Model(GPT2PreTrainedModel):
 
             if self.output_attentions:
                 if self.config.is_decoder:
-                    attn_idx=3
+                    all_attentions.append(outputs[3])
                     all_attentions.append(outputs[4])
                 else:
-                    attn_idx=2
-                all_attentions.append(outputs[attn_idx])
+                    all_attentions.append(outputs[2])
 
         hidden_states = self.ln_f(hidden_states)
 
@@ -694,7 +697,10 @@ class GPT2Model(GPT2PreTrainedModel):
 
 @add_start_docstrings(
     """The GPT2 Model transformer with a language modeling head on top
-    (linear layer with weights tied to the input embeddings). """,
+    (linear layer with weights tied to the input embeddings).
+    To use it as a decoder in encoder decoder model, set config.is_decoder=Ture
+    and pass encoder_hidden_states and encoder_attention_mask in forward.
+    During decoding in encoder decoder function, pass encoder_past to speed up decoding.""",
     GPT2_START_DOCSTRING,
 )
 class GPT2LMHeadModel(GPT2PreTrainedModel):
@@ -721,8 +727,13 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
         return_inputs = {"input_ids": input_ids, "past": past, 'attention_mask':attention_mask}
 
+        # When called from internal encoder decoder model.
         if encoder_past is not None:
             return_inputs['encoder_past'] = encoder_past
+
+        # When called from PretrainedModel generate() function while being used as decoder.
+        if 'encoder_hidden_states' in kwargs:
+            return_inputs['encoder_hidden_states'] = kwargs['encoder_hidden_states']
 
         return return_inputs
 
@@ -744,6 +755,10 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         use_cache=True,
     ):
         r"""
+        encoder_hidden_states (:obj:`torch.FloatTensor` of shape :obj: `(batch_size, sequence_length, config.hidden_size)`):
+            Encoder hidden states passed from the encoder if GPT2 is being used as decoder, i.e. config.is_decoder=True.
+        encoder_hidden_mask (:obj:`torch.FloatTensor` of shape :obj: `(batch_size, sequence_length)`):
+            Encoder hidden mask passed from the encoder if GPT2 is being used as decoder, i.e. config.is_decoder=True.
         lm_labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`, defaults to :obj:`None`):
             Labels for language modeling.
             Note that the labels **are shifted** inside the model, i.e. you can set ``lm_labels = input_ids``
@@ -760,14 +775,17 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         past (:obj:`List[torch.FloatTensor]` of length :obj:`config.n_layers` with each tensor of shape :obj:`(2, batch_size, num_heads, sequence_length, embed_size_per_head)`):
             Contains pre-computed hidden-states (key and values in the attention blocks).
             Can be used (see `past` input) to speed up sequential decoding.
+        encoder_past (:obj:`List[torch.FloatTensor]` of length :obj:`config.n_layers` with each tensor of shape :obj:`(2, batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`):
+            Contains pre-computed hidden-states (key and values in cross attention blocks).
+            Can be used to speed up sequential decoding.
         hidden_states (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``config.output_hidden_states=True``):
             Tuple of :obj:`torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer)
             of shape :obj:`(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
         attentions (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``config.output_attentions=True``):
-            Tuple of :obj:`torch.FloatTensor` (one for each layer) of shape
-            :obj:`(batch_size, num_heads, sequence_length, sequence_length)`.
+            Tuple of :obj:`torch.FloatTensor` (two for each layer: one self attention and the other cross attention) of shape
+            :obj:`(batch_size, num_heads, encoder_sequence_length, sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
@@ -809,7 +827,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         if lm_labels is not None:
             # Shift so that tokens < n predict n
             shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            shift_labels = lm_labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
